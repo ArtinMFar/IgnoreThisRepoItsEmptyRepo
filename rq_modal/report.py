@@ -42,18 +42,20 @@ def longbench_table(res):
 
 
 def task_table(res):
-    rows = ["| Model | ARC-Challenge | GSM8K (thinking off) | GSM8K (thinking on) | ChartQA (vision) |",
-            "|---|---|---|---|---|"]
+    rows = ["| Model | ARC-Challenge | GSM8K (thinking off) | GSM8K (thinking on) | MATH-500 | HumanEval | ChartQA (vision) |",
+            "|---|---|---|---|---|---|---|"]
     for k, r in res.items():
         if "arc_challenge" not in r:
             continue
 
         def g(key):
             v = r.get(key)
-            return f"{v['acc']:.1f}" if isinstance(v, dict) else "n/a"
+            if isinstance(v, dict):
+                return f"{v['acc']:.1f}"
+            return f"{v:.1f}" if isinstance(v, (int, float)) else "n/a"
 
-        rows.append(f"| {NAMES[k]} | {r['arc_challenge']} | {g('gsm8k_nothink')} | {g('gsm8k_think')} | "
-                    f"{r.get('chartqa', 'n/a')} |")
+        rows.append(f"| {NAMES[k]} | {g('arc_challenge')} | {g('gsm8k_nothink')} | {g('gsm8k_think')} | {g('math500')} | "
+                    f"{g('humaneval')} | {g('chartqa')} |")
     return "\n".join(rows)
 
 

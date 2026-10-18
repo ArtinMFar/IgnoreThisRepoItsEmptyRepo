@@ -34,8 +34,10 @@ matter how long the history gets. It keeps Qwen3.5's image understanding and bot
 - ⚠️ **Exact retrieval from long documents is much weaker than full attention:** LongBench-E average 35.2 vs 69.0
   (untrained conversion 33.5). The fixed-size state keeps the gist of long histories, but quoting a specific detail from
   far back is unreliable. Use the original model for that.
-- ⚠️ **Some quality loss elsewhere:** GSM8K 90.8 with thinking off (original 95.0) and 82.5 with thinking on (93.8); long
-  reasoning traces that run past the window suffer most. ARC-Challenge 89.2 (91.0), ChartQA 60.7 (70.7).
+- ⚠️ **Short-input quality dropped a few points.** Thinking off: GSM8K 90.8 (original 95.0), MATH-500 71.0 (75.0),
+  HumanEval 75.0 (84.1), ARC-Challenge 89.2 (91.0), ChartQA 60.7 (70.7). Thinking on: GSM8K 82.5 (93.8). On inputs that
+  fit in the window the untrained conversion still behaves like the original, so these losses come from the short
+  training run: it traded some short-input quality for long-text ability.
 
 ## What changed
 
@@ -101,8 +103,9 @@ All new parameters (33M, 0.7% of the model) start at values that reproduce the o
 
 ## Results
 
-Sample sizes are small (LongBench-E: 6 questions per length bucket; GSM8K: 120 / 80 problems; ChartQA: 150), so
-individual cells vary by several points.
+Sample sizes are small (LongBench-E: 6 questions per length bucket; GSM8K: 120 / 80 problems; MATH-500: first 100;
+ChartQA: 150), so individual cells vary by several points. "Converted, untrained" is the same architecture right after
+conversion, before any training: it shows what the distillation run changed.
 
 ### Long-text perplexity by token position (PG19 test books, 32k tokens each; lower is better)
 
@@ -122,12 +125,15 @@ Tokens past 2048 can only be predicted from what the recurrent state remembers.
 | Converted, untrained | 36 / 14 / 16 | 28 / 37 / 17 | 38 / 29 / 24 | 33 / 45 / 52 | 33 / 33 / 67 | 33.5 |
 | **RecurrentQwen-4B** | 36 / 44 / 28 | 38 / 19 / 19 | 42 / 29 / 23 | 29 / 52 / 36 | 33 / 33 / 67 | 35.2 |
 
-### General ability, reasoning (thinking on/off) and vision
+### General ability, math, coding (thinking on/off) and vision
 
-| Model | ARC-Challenge | GSM8K (thinking off) | GSM8K (thinking on) | ChartQA (vision) |
-|---|---|---|---|---|
-| Qwen3.5-4B (original, full attention) | 91.0 | 95.0 | 93.8 | 70.7 |
-| **RecurrentQwen-4B** | 89.2 | 90.8 | 82.5 | 60.7 |
+MATH-500 and HumanEval run with thinking off; HumanEval is pass@1 with the generated code executed against the tests.
+
+| Model | ARC-Challenge | GSM8K (thinking off) | GSM8K (thinking on) | MATH-500 | HumanEval | ChartQA (vision) |
+|---|---|---|---|---|---|---|
+| Qwen3.5-4B (original, full attention) | 91.0 | 95.0 | 93.8 | 75.0 | 84.1 | 70.7 |
+| Converted, untrained | 91.0 | 94.2 | 88.8 | 75.0 | 81.1 | 71.3 |
+| **RecurrentQwen-4B** | 89.2 | 90.8 | 82.5 | 71.0 | 75.0 | 60.7 |
 
 ### Memory and latency (H100, batch 1, bf16, plain Hugging Face implementation)
 
@@ -222,7 +228,235 @@ FineVision (HuggingFaceM4) and the original model's own answers to real prompts.
 <details><summary>Raw evaluation results (JSON)</summary>
 
 ```json
-{{EVAL_JSON}}
+{
+ "original": {
+  "model": "original",
+  "pg19_ppl": {
+   "0k-2k": 12.428,
+   "2k-4k": 12.749,
+   "4k-8k": 12.131,
+   "8k-16k": 11.575,
+   "16k-32k": 11.302
+  },
+  "eval_minutes": 24.3,
+  "longbench_e": {
+   "hotpotqa_e": {
+    "0-4k": 69.4,
+    "4-8k": 94.4,
+    "8k+": 63.9
+   },
+   "2wikimqa_e": {
+    "0-4k": 65.3,
+    "4-8k": 66.7,
+    "8k+": 73.3
+   },
+   "multifieldqa_en_e": {
+    "0-4k": 49.6,
+    "4-8k": 51.3,
+    "8k+": 51.1
+   },
+   "qasper_e": {
+    "0-4k": 64.4,
+    "4-8k": 56.3,
+    "8k+": 28.8
+   },
+   "passage_retrieval_en_e": {
+    "0-4k": 100.0,
+    "4-8k": 100.0,
+    "8k+": 100.0
+   }
+  },
+  "arc_challenge": 91.0,
+  "chartqa": 70.7,
+  "gsm8k_nothink": {
+   "acc": 95.0,
+   "mean_tokens": 314,
+   "over_2048": 0
+  },
+  "gsm8k_think": {
+   "acc": 93.8,
+   "mean_tokens": 2114,
+   "over_2048": 24
+  },
+  "bench": {
+   "4096": {
+    "cache_mb": 177.5,
+    "prefill_s": 0.13,
+    "ttft_new_turn_ms": 78.0,
+    "decode_ms_per_token": 52.33,
+    "peak_mem_gb": 9.26
+   },
+   "16384": {
+    "cache_mb": 561.5,
+    "prefill_s": 0.51,
+    "ttft_new_turn_ms": 74.4,
+    "decode_ms_per_token": 59.47,
+    "peak_mem_gb": 10.43
+   },
+   "65536": {
+    "cache_mb": 2097.5,
+    "prefill_s": 3.11,
+    "ttft_new_turn_ms": 114.0,
+    "decode_ms_per_token": 55.33,
+    "peak_mem_gb": 13.99
+   },
+   "131072": {
+    "cache_mb": 4145.5,
+    "prefill_s": 9.33,
+    "ttft_new_turn_ms": 178.2,
+    "decode_ms_per_token": 55.24,
+    "peak_mem_gb": 19.99
+   }
+  },
+  "humaneval": 84.1,
+  "math500": 75.0
+ },
+ "naive": {
+  "model": "naive",
+  "pg19_ppl": {
+   "0k-2k": 12.421,
+   "2k-4k": 13.413,
+   "4k-8k": 16.907,
+   "8k-16k": 24.973,
+   "16k-32k": 36.583
+  },
+  "eval_minutes": 6.2,
+  "longbench_e": {
+   "hotpotqa_e": {
+    "0-4k": 36.1,
+    "4-8k": 14.3,
+    "8k+": 16.4
+   },
+   "2wikimqa_e": {
+    "0-4k": 27.8,
+    "4-8k": 36.7,
+    "8k+": 16.7
+   },
+   "multifieldqa_en_e": {
+    "0-4k": 38.3,
+    "4-8k": 28.9,
+    "8k+": 24.2
+   },
+   "qasper_e": {
+    "0-4k": 33.0,
+    "4-8k": 44.9,
+    "8k+": 52.2
+   },
+   "passage_retrieval_en_e": {
+    "0-4k": 33.3,
+    "4-8k": 33.3,
+    "8k+": 66.7
+   }
+  },
+  "arc_challenge": 91.0,
+  "chartqa": 71.3,
+  "gsm8k_nothink": {
+   "acc": 94.2,
+   "mean_tokens": 317,
+   "over_2048": 0
+  },
+  "humaneval": 81.1,
+  "math500": 75.0,
+  "gsm8k_think": {
+   "acc": 88.8,
+   "mean_tokens": 2719,
+   "over_2048": 30
+  }
+ },
+ "final": {
+  "model": "final",
+  "pg19_ppl": {
+   "0k-2k": 12.627,
+   "2k-4k": 13.38,
+   "4k-8k": 13.089,
+   "8k-16k": 12.777,
+   "16k-32k": 12.756
+  },
+  "eval_minutes": 25.9,
+  "longbench_e": {
+   "hotpotqa_e": {
+    "0-4k": 36.1,
+    "4-8k": 44.4,
+    "8k+": 27.8
+   },
+   "2wikimqa_e": {
+    "0-4k": 37.5,
+    "4-8k": 19.4,
+    "8k+": 18.9
+   },
+   "multifieldqa_en_e": {
+    "0-4k": 42.2,
+    "4-8k": 28.6,
+    "8k+": 23.4
+   },
+   "qasper_e": {
+    "0-4k": 29.2,
+    "4-8k": 52.2,
+    "8k+": 35.6
+   },
+   "passage_retrieval_en_e": {
+    "0-4k": 33.3,
+    "4-8k": 33.3,
+    "8k+": 66.7
+   }
+  },
+  "arc_challenge": 89.2,
+  "chartqa": 60.7,
+  "gsm8k_nothink": {
+   "acc": 90.8,
+   "mean_tokens": 293,
+   "over_2048": 0
+  },
+  "gsm8k_think": {
+   "acc": 82.5,
+   "mean_tokens": 3263,
+   "over_2048": 39
+  },
+  "bench": {
+   "4096": {
+    "cache_mb": 125.5,
+    "prefill_s": 0.18,
+    "ttft_new_turn_ms": 123.6,
+    "decode_ms_per_token": 59.18,
+    "peak_mem_gb": 9.43
+   },
+   "16384": {
+    "cache_mb": 125.5,
+    "prefill_s": 0.77,
+    "ttft_new_turn_ms": 80.2,
+    "decode_ms_per_token": 59.28,
+    "peak_mem_gb": 10.41
+   },
+   "65536": {
+    "cache_mb": 125.5,
+    "prefill_s": 2.93,
+    "ttft_new_turn_ms": 74.9,
+    "decode_ms_per_token": 59.24,
+    "peak_mem_gb": 10.42
+   },
+   "131072": {
+    "cache_mb": 125.5,
+    "prefill_s": 5.83,
+    "ttft_new_turn_ms": 75.5,
+    "decode_ms_per_token": 55.68,
+    "peak_mem_gb": 10.42
+   }
+  },
+  "cache_consistency": {
+   "history_tokens": 8662,
+   "cache_mb": 125.5,
+   "ttft_ms": {
+    "cached": 148.0,
+    "full_recompute": 404.4
+   },
+   "same_tokens": "3/41",
+   "cached_answer": "This section details the \"Five Million Loan Election\" of 1858, a controversial constitutional amendment that funded railroad construction, which ultimately failed due to financial mismanagement and political corruption, leading to a",
+   "fresh_answer": "This section describes the vibrant atmosphere of St. Paul's levee during the steamboat era, the intense political controversy surrounding the \"Five Million Loan Election\" and its disastrous financial consequences, and the brief,"
+  },
+  "humaneval": 75.0,
+  "math500": 71.0
+ }
+}
 ```
 
 </details>

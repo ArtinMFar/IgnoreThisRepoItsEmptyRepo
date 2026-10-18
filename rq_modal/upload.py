@@ -88,6 +88,23 @@ def upload(repo_name: str, ckpt: str = "final", private: bool = False):
     return repo_id
 
 
+@app.function(image=image, secrets=[hf_secret], timeout=600)
+def update_card_fn(repo_name: str, readme: str):
+    """Replace only the model card (README.md) of an uploaded model."""
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    repo_id = f"{api.whoami()['name']}/{repo_name}"
+    api.upload_file(path_or_fileobj=readme.encode(), path_in_repo="README.md", repo_id=repo_id,
+                    commit_message="Update model card with additional benchmarks")
+    return repo_id
+
+
+@app.local_entrypoint()
+def update_card(repo_name: str = "RecurrentQwen-4b", readme_path: str = "hub/README.md"):
+    print(update_card_fn.remote(repo_name, open(readme_path).read()))
+
+
 @app.local_entrypoint()
 def main(repo_name: str = "RecurrentQwen-4b", ckpt: str = "final"):
     print(upload.remote(repo_name, ckpt))

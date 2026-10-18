@@ -188,15 +188,15 @@ def last_number(text):
     return nums[-1].replace(",", "").rstrip(".") if nums else None
 
 
-def eval_gsm8k(model, tok, n, thinking):
+def eval_gsm8k(model, tok, n, thinking, batch=64):
     from datasets import load_dataset
 
     ds = load_dataset("openai/gsm8k", "main", split="test").select(range(n))
     correct, lengths, long_traces = 0, [], 0
     convs = [[{"role": "user", "content": r["question"] + "\nPut the final answer after 'Answer:'."}] for r in ds]
     outs = []
-    for i in range(0, n, 64):
-        outs += generate_batch(model, tok, convs[i : i + 64], thinking, 6144 if thinking else 1024)
+    for i in range(0, n, batch):
+        outs += generate_batch(model, tok, convs[i : i + batch], thinking, 6144 if thinking else 1024)
     for r, out in zip(ds, outs):
         n_tok = len(tok(out).input_ids)
         lengths.append(n_tok)
@@ -447,3 +447,130 @@ def consistency(name: str = "final", n_turns: int = 4, chars_per_turn: int = 900
 @app.local_entrypoint()
 def check_consistency(name: str = "final"):
     print(consistency.remote(name))
+
+
+def _run_program(program, timeout=10):
+    import subprocess
+    import sys
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        with open(f"{d}/prog.py", "w") as fh:
+            fh.write(program)
+        try:
+            return subprocess.run([sys.executable, f"{d}/prog.py"], cwd=d, capture_output=True,
+                                  timeout=timeout).returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
+
+
+def eval_humaneval(model, tok, batch=82):
+    """HumanEval pass@1 (greedy, thinking off): generated code is executed against the unit tests."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from datasets import load_dataset
+
+    ds = list(load_dataset("openai/openai_humaneval", split="test"))
+    convs = [[{"role": "user", "content": "Complete the following Python function. Reply with the complete function "
+                                          "in a single ```python code block.\n\n```python\n" + r["prompt"] + "```"}]
+             for r in ds]
+    outs = []
+    for i in range(0, len(convs), batch):
+        outs += generate_batch(model, tok, convs[i : i + batch], False, 768)
+    programs = []
+    for r, out in zip(ds, outs):
+        text = strip_think(out)
+        blocks = re.findall(r"```(?:python|py)?\s*\n(.*?)```", text, re.S)
+        code = max(blocks, key=len) if blocks else text
+        if f"def {r['entry_point']}" not in code:
+            code = r["prompt"] + code
+        else:
+            header = "\n".join(l for l in r["prompt"].splitlines() if l.startswith(("import ", "from ")))
+            code = header + "\n" + code
+        programs.append(code + "\n\n" + r["test"] + f"\n\ncheck({r['entry_point']})\n")
+    with ThreadPoolExecutor(8) as pool:
+        passed = list(pool.map(_run_program, programs))
+    return round(100 * sum(passed) / len(passed), 1)
+
+
+def _last_boxed(text):
+    i = text.rfind("\\boxed")
+    if i < 0:
+        return None
+    j = text.find("{", i)
+    if j < 0:
+        return None
+    depth = 0
+    for k in range(j, len(text)):
+        depth += {"{": 1, "}": -1}.get(text[k], 0)
+        if depth == 0:
+            return text[j + 1 : k]
+    return None
+
+
+def _norm_math(s):
+    s = re.sub(r"\\text\{(.*?)\}", r"\1", s.strip())
+    for a, b in (("\\left", ""), ("\\right", ""), ("\\!", ""), ("\\,", ""), ("dfrac", "frac"),
+                 ("tfrac", "frac"), ("^\\circ", ""), ("^{\\circ}", ""), ("\\$", ""), ("$", ""), (" ", "")):
+        s = s.replace(a, b)
+    return s.rstrip(".")
+
+
+def eval_math500(model, tok, n=100, batch=100):
+    """MATH-500 (first n problems, thinking off): strict match of the last \\boxed{} answer."""
+    from datasets import load_dataset
+
+    ds = list(load_dataset("HuggingFaceH4/MATH-500", split="test"))[:n]
+    convs = [[{"role": "user", "content": r["problem"] + "\nPut your final answer within \\boxed{}."}] for r in ds]
+    outs = []
+    for i in range(0, n, batch):
+        outs += generate_batch(model, tok, convs[i : i + batch], False, 1536)
+    correct = 0
+    for r, out in zip(ds, outs):
+        pred = _last_boxed(strip_think(out))
+        correct += pred is not None and _norm_math(pred) == _norm_math(r["answer"])
+    return round(100 * correct / n, 1)
+
+
+@app.function(image=gpu_image, gpu="L40S", volumes={VOL_PATH: volume}, secrets=[hf_secret], timeout=5400,
+              cpu=8, memory=65536)
+def evaluate_extra(name: str, sections: list):
+    """Run extra benchmark sections for one model and merge them into its eval JSON."""
+    import torch
+    from transformers import AutoProcessor
+
+    volume.reload()
+    processor = AutoProcessor.from_pretrained(BASE_MODEL)
+    tok = processor.tokenizer
+    model = load_model(name)
+    path = f"{OUT_DIR}/eval_{name}.json"
+    res = json.load(open(path)) if os.path.exists(path) else dict(model=name)
+    fns = {
+        "arc_challenge": lambda: eval_arc(model, tok, 400),
+        "chartqa": lambda: eval_chartqa(model, processor, 150),
+        "gsm8k_nothink": lambda: eval_gsm8k(model, tok, 120, thinking=False, batch=120),
+        "gsm8k_think": lambda: eval_gsm8k(model, tok, 80, thinking=True, batch=80),
+        "humaneval": lambda: eval_humaneval(model, tok),
+        "math500": lambda: eval_math500(model, tok),
+    }
+    t0 = time.time()
+    for key in sections:
+        try:
+            res[key] = fns[key]()
+        except Exception as e:
+            import traceback
+
+            traceback.print_exc()
+            res[key] = f"failed: {e!r}"[:500]
+        print(name, key, res[key], f"({(time.time() - t0) / 60:.1f} min)", flush=True)
+        json.dump(res, open(path, "w"), indent=1)
+        volume.commit()
+    return {k: res[k] for k in sections}
+
+
+@app.local_entrypoint()
+def extra():
+    jobs = [("naive", ["arc_challenge", "chartqa", "gsm8k_nothink", "humaneval", "math500", "gsm8k_think"]),
+            ("final", ["humaneval", "math500"]), ("original", ["humaneval", "math500"])]
+    for job, r in zip(jobs, evaluate_extra.starmap(jobs, return_exceptions=True)):
+        print(job[0], r)
