@@ -310,6 +310,51 @@ def bench(model, tok, lengths):
     return res
 
 
+def eval_cache_consistency(model, tok, n_turns=4, chars_per_turn=9000):
+    """README usage pattern: keep the cache across turns and feed only new tokens. Compare the last answer and its
+    time-to-first-token with recomputing the whole (window-exceeding) history from scratch."""
+    import torch
+    from datasets import load_dataset
+    from transformers import DynamicCache
+
+    book = next(r["text"] for r in load_dataset("emozilla/pg19", split="test") if len(r["text"]) > 60000)
+    cache = DynamicCache(config=model.config)
+    seen = torch.empty(1, 0, dtype=torch.long, device="cuda")
+    answers, ttft = [], {}
+    for i in range(n_turns):
+        part = book[i * chars_per_turn : (i + 1) * chars_per_turn]
+        msg = f"Here is part {i + 1} of a book:\n{part}\nSummarise this part in one sentence."
+        turn = ("\n" if seen.numel() else "") + f"<|im_start|>user\n{msg}<|im_end|>\n<|im_start|>assistant\n" \
+               "<think>\n\n</think>\n\n"
+        new = tok(turn, return_tensors="pt", add_special_tokens=False).input_ids.cuda()
+        ids = torch.cat([seen, new], dim=1)
+        with torch.no_grad():
+            torch.cuda.synchronize()
+            t0 = time.time()
+            out = model.generate(input_ids=ids, past_key_values=cache, max_new_tokens=1, do_sample=False,
+                                 temperature=None, top_p=None, top_k=None)
+            torch.cuda.synchronize()
+            ttft["cached"] = round(1000 * (time.time() - t0), 1)
+            out = model.generate(input_ids=out, past_key_values=cache, max_new_tokens=40, do_sample=False,
+                                 temperature=None, top_p=None, top_k=None)
+        answers.append(out[0, ids.shape[1] :])
+        last_ids, seen = ids, out
+    with torch.no_grad():
+        torch.cuda.synchronize()
+        t0 = time.time()
+        fresh = model.generate(input_ids=last_ids, max_new_tokens=1, do_sample=False, temperature=None, top_p=None,
+                               top_k=None)
+        torch.cuda.synchronize()
+        ttft["full_recompute"] = round(1000 * (time.time() - t0), 1)
+        fresh = model.generate(input_ids=last_ids, max_new_tokens=41, do_sample=False, temperature=None,
+                               top_p=None, top_k=None)[0, last_ids.shape[1] :]
+    a = answers[-1]
+    n = min(len(a), len(fresh))
+    return dict(history_tokens=int(last_ids.shape[1]), cache_mb=round(cache_bytes(cache) / 2**20, 1),
+                ttft_ms=ttft, same_tokens=f"{int((a[:n] == fresh[:n]).sum())}/{n}",
+                cached_answer=tok.decode(a, skip_special_tokens=True), fresh_answer=tok.decode(fresh, skip_special_tokens=True))
+
+
 @app.function(image=gpu_image, gpu="H100", volumes={VOL_PATH: volume}, secrets=[hf_secret], timeout=3 * 3600,
               cpu=8, memory=65536)
 def evaluate(name: str, quick: bool = False):
@@ -347,6 +392,7 @@ def evaluate(name: str, quick: bool = False):
         run("gsm8k_nothink", lambda: eval_gsm8k(model, tok, 10 if quick else 120, thinking=False))
         run("gsm8k_think", lambda: eval_gsm8k(model, tok, 10 if quick else 80, thinking=True))
         run("bench", lambda: bench(model, tok, [4096, 16384] if quick else [4096, 16384, 65536, 131072]))
+        run("cache_consistency", lambda: eval_cache_consistency(model, tok))
     return res
 
 

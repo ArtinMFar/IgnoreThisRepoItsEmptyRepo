@@ -111,7 +111,7 @@ def vision_worker(processor, pool, out_q, target_tokens, seed):
 @app.function(image=gpu_image, gpu="B200", volumes={VOL_PATH: volume, GEN_PATH: gen_volume}, secrets=[hf_secret],
               timeout=6 * 3600,
               cpu=8, memory=65536, retries=modal.Retries(max_retries=2, initial_delay=10.0))
-def train(budget_minutes: float = 130.0, smoke: bool = False, tokens_per_step: int = 65536,
+def train(budget_minutes: float = 100.0, smoke: bool = False, tokens_per_step: int = 65536,
           lr: float = 1e-5, ce_weight: float = 0.2, vision_tokens: int = 6000, ckpt_minutes: float = 30.0,
           chunk: int = 4096, attn: str = "flex", profile: bool = False, pad_multiple: int = 2048):
     import numpy as np
@@ -133,8 +133,11 @@ def train(budget_minutes: float = 130.0, smoke: bool = False, tokens_per_step: i
     run_dir = f"{CKPT_DIR}/smoke" if smoke else f"{CKPT_DIR}/latest"
     state = dict(step=0, seq_index=0, elapsed=0.0, tokens=0, onpolicy_index=0)
     if not smoke and os.path.exists(f"{run_dir}/train_state.json"):
-        state = json.load(open(f"{run_dir}/train_state.json"))
-        print("resuming from", state, flush=True)
+        try:
+            state = json.load(open(f"{run_dir}/train_state.json"))
+            print("resuming from", state, flush=True)
+        except Exception as e:
+            print("unreadable train_state.json, starting fresh:", repr(e), flush=True)
 
     processor = AutoProcessor.from_pretrained(BASE_MODEL)
     teacher = Qwen3_5ForConditionalGeneration.from_pretrained(BASE_MODEL, dtype=torch.bfloat16,
@@ -273,8 +276,10 @@ def train(budget_minutes: float = 130.0, smoke: bool = False, tokens_per_step: i
         os.makedirs(path, exist_ok=True)
         sd = {k: v.detach().to(torch.bfloat16) for k, v in student.state_dict().items()}
         student.save_pretrained(path, state_dict=sd, safe_serialization=True)
-        if not final:
-            json.dump(state, open(f"{path}/train_state.json", "w"))
+        if not final:  # written last and atomically, so a resume never sees state without matching weights
+            with open(f"{path}/train_state.json.tmp", "w") as fh:
+                json.dump({k: float(v) if isinstance(v, float) else int(v) for k, v in state.items()}, fh)
+            os.replace(f"{path}/train_state.json.tmp", f"{path}/train_state.json")
         volume.commit()
         print(f"saved {path} in {time.time() - t0:.0f}s", flush=True)
 
@@ -282,18 +287,19 @@ def train(budget_minutes: float = 130.0, smoke: bool = False, tokens_per_step: i
     onpolicy = None
     seq_index = state["seq_index"]
     last_ckpt = time.time()
+    resume_step0 = state["step"]  # the optimizer state is not checkpointed, so warm up again after a resume
     log = []
     while True:
         elapsed = state["elapsed"] + (time.time() - t_start)
         progress = max(elapsed / budget_s, seq_index / len(lens))
         if progress >= 1.0 or seq_index >= len(lens) or (smoke and state["step"] >= 6):
             break
-        f = lr_factor(progress, state["step"])
+        f = lr_factor(progress, state["step"] - resume_step0)
         for g in opt.param_groups:
             g["lr"] = base_lrs[g["name"]] * f
 
         batches, n = [], 0
-        if onpolicy is None and state["step"] % 20 == 0:
+        if onpolicy is None and (state["step"] - resume_step0) % 20 == 0:
             try:
                 gen_volume.reload()
                 onpolicy = load_onpolicy(pool)
@@ -307,7 +313,7 @@ def train(budget_minutes: float = 130.0, smoke: bool = False, tokens_per_step: i
         while n < tokens_per_step - vision_tokens and seq_index < len(lens):
             a, b = offs[seq_index], offs[seq_index + 1]
             batches.append(text_batch(np.asarray(ids_all[a:b]), np.asarray(mask_all[a:b])))
-            n += b - a
+            n += int(b - a)
             seq_index += 1
         text_tokens = n
         try:
@@ -343,25 +349,31 @@ def train(budget_minutes: float = 130.0, smoke: bool = False, tokens_per_step: i
             rec["skip_red"] = float(torch.stack([g.skip_redundancy.mean() for g in gdn]).mean())
             rec["phase_w"] = float(torch.stack([g.phase_proj.weight.norm() for g in gdn]).mean())
             print(json.dumps({k: round(v, 4) if isinstance(v, float) else v for k, v in rec.items()}), flush=True)
-        if not smoke and time.time() - last_ckpt > ckpt_minutes * 60:
+        # an early checkpoint (step 5) proves saving works; then every `ckpt_minutes`
+        if not smoke and (state["step"] == resume_step0 + 5 or time.time() - last_ckpt > ckpt_minutes * 60):
             state["elapsed"] = state["elapsed"] + (time.time() - t_start)
             t_start = time.time()
-            save(run_dir)
+            try:
+                save(run_dir)
+            except Exception as e:  # a failed checkpoint must not kill the run
+                print("checkpoint failed:", repr(e), flush=True)
             last_ckpt = time.time()
 
     state["elapsed"] = state["elapsed"] + (time.time() - t_start)
     os.makedirs(f"{CKPT_DIR}/logs", exist_ok=True)
     with open(f"{CKPT_DIR}/logs/{'smoke' if smoke else 'train'}_{int(time.time())}.jsonl", "w") as fh:
         fh.writelines(json.dumps(r) + "\n" for r in log)
-    if smoke:
-        save(f"{CKPT_DIR}/smoke", final=True)
-    else:
-        save(run_dir)
-        save(f"{CKPT_DIR}/final", final=True)
+    final_dir = f"{CKPT_DIR}/smoke" if smoke else f"{CKPT_DIR}/final"
+    for attempt in range(3):
+        try:
+            save(final_dir, final=True)
+            break
+        except Exception as e:
+            print("final save failed, retrying:", repr(e), flush=True)
     print("done", state, flush=True)
     return state
 
 
 @app.local_entrypoint()
-def main(smoke: bool = False, budget_minutes: float = 130.0, attn: str = "flex", profile: bool = False):
+def main(smoke: bool = False, budget_minutes: float = 100.0, attn: str = "flex", profile: bool = False):
     print(train.remote(budget_minutes=budget_minutes, smoke=smoke, attn=attn, profile=profile))
