@@ -400,3 +400,50 @@ def evaluate(name: str, quick: bool = False):
 def main(models: str = "final,original,naive", quick: bool = False):
     for r in evaluate.starmap([(m, quick) for m in models.split(",")], return_exceptions=True):
         print(json.dumps(r, indent=1, default=str))
+
+
+@app.function(image=gpu_image, gpu="H100", volumes={VOL_PATH: volume}, secrets=[hf_secret], timeout=1800,
+              cpu=4, memory=65536)
+def consistency(name: str = "final", n_turns: int = 4, chars_per_turn: int = 9000):
+    """Logit-level check: cached turn-by-turn processing vs one full pass over a window-exceeding history."""
+    import torch
+    from datasets import load_dataset
+    from transformers import AutoTokenizer, DynamicCache
+
+    from recurrent_qwen.modeling_recurrent_qwen import RecurrentQwenForConditionalGeneration
+
+    tok = AutoTokenizer.from_pretrained(BASE_MODEL)
+    book = next(r["text"] for r in load_dataset("emozilla/pg19", split="test") if len(r["text"]) > 60000)
+    pieces = []
+    for i in range(n_turns):
+        part = book[i * chars_per_turn : (i + 1) * chars_per_turn]
+        s = ("\n" if i else "") + f"<|im_start|>user\nHere is part {i + 1} of a book:\n{part}\nSummarise this part " \
+            "in one sentence.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        pieces.append(tok(s, return_tensors="pt", add_special_tokens=False).input_ids.cuda())
+    res = {}
+    for dtype in (torch.float32, torch.bfloat16):
+        model = RecurrentQwenForConditionalGeneration.from_pretrained(f"{CKPT_DIR}/{name}", dtype=dtype).cuda().eval()
+        with torch.no_grad():
+            cache = DynamicCache(config=model.config)
+            for p in pieces:
+                cached = model(input_ids=p, past_key_values=cache, use_cache=True, logits_to_keep=1).logits[0, -1]
+            full = model(input_ids=torch.cat(pieces, 1), logits_to_keep=1).logits[0, -1]
+        top2 = full.float().topk(2).values
+        res[str(dtype)] = dict(history_tokens=int(sum(p.shape[1] for p in pieces)),
+                               max_abs_logit_diff=round((cached.float() - full.float()).abs().max().item(), 4),
+                               kl=float(torch.nn.functional.kl_div(cached.float().log_softmax(-1),
+                                                                   full.float().log_softmax(-1), log_target=True,
+                                                                   reduction="sum")),
+                               same_argmax=bool(cached.argmax() == full.argmax()),
+                               top1_top2_margin=round((top2[0] - top2[1]).item(), 3))
+        print(dtype, res[str(dtype)], flush=True)
+        del model
+        torch.cuda.empty_cache()
+    json.dump(res, open(f"{OUT_DIR}/consistency_{name}.json", "w"), indent=1)
+    volume.commit()
+    return res
+
+
+@app.local_entrypoint()
+def check_consistency(name: str = "final"):
+    print(consistency.remote(name))
