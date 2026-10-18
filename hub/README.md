@@ -39,24 +39,31 @@ full softmax-attention layers whose KV cache grows with every token. RecurrentQw
 
 ### Ideas taken from Mamba-3 (and Mamba)
 
-1. **Selective skip gate with a novelty signal.** In Mamba, a token with a tiny timestep leaves the state untouched;
-   Gated DeltaNet's decay and write strength are separate gates, so even an uninformative token still decays (erodes)
-   the memory. RecurrentQwen adds a per-head gate `skip = sigmoid(W·x + u·r + c)` that scales the decay, the write
-   strength and the rotation step together. `r = -log(1 - max cos-sim)` measures how much the current key repeats one
-   of the previous 128 keys: it is about 2 on ordinary prose and 6 to 9 on repetitive streams (logs, repeated tool output,
-   game-engine ticks, boilerplate). Repetitive content therefore gets low priority in the long-term state and stops
-   drowning out earlier conversation, while the local attention window still sees it verbatim. The gate is learned; the
-   redundancy signal costs a 128-key rolling buffer per layer.
-2. **Complex-valued state via data-dependent rotary embeddings** (Mamba-3's "RoPE trick"). A learned per-head angle is
-   accumulated over time and applied as a rotation to 16 dimension pairs of the keys and queries. This is equivalent to a
-   complex-valued transition and gives the recurrence rotational dynamics that real-valued decays cannot express
-   (useful for tracking state such as parity, counters or positions). The accumulated phase is part of the fixed-size
-   state.
+1. **Selective skip gate with a novelty signal.** In Mamba the timestep Δ controls both forgetting and writing: a small Δ
+   keeps the state and ignores the token. Gated DeltaNet controls decay and write strength with separate gates, so even an
+   uninformative token still decays (erodes) the memory. RecurrentQwen adds a per-head gate
+   `skip = sigmoid(W·x + u·r + c)` that scales the decay, the write strength and the rotation step together.
+   `r = -log(1 - max cos-sim)` measures how much the current key repeats one of the previous 128 keys: it is about 2 on
+   ordinary prose and 6 to 9 on repetitive streams (logs, repeated tool output, boilerplate, game-engine ticks).
+   Repetitive content therefore gets low priority in the long-term state and stops drowning out earlier conversation,
+   while the local attention window still sees it verbatim. The gate is learned from ordinary data during distillation;
+   the redundancy signal costs a 128-key rolling buffer per layer.
+2. **Complex-valued state via data-dependent rotary embeddings** (Mamba-3's "RoPE trick", Proposition 3 of the paper). A
+   learned per-head angle is accumulated over time and applied as a rotation to 16 dimension pairs of the keys and
+   queries. This is equivalent to a complex-valued transition and gives the recurrence rotational dynamics that
+   real-valued decays cannot express (Mamba-3 shows this is what lets it solve state-tracking tasks such as parity).
+   Unlike Mamba-3, which scales each rotation step by Δ, the step is scaled by the skip gate's `keep`, so skipped tokens do
+   not rotate the state either. The accumulated phase is part of the fixed-size state.
 3. **QK normalisation** (Mamba-3's BC norm) was already present in Gated DeltaNet and is kept.
 
-Not adopted: Mamba-3's exponential-trapezoidal discretisation (Gated DeltaNet keeps its short causal convolution,
-which subsumes the two-tap input mixing it provides) and MIMO state updates (a decode-throughput optimisation that
-needs new kernels and does not change what the state can store).
+Not adopted from Mamba-3:
+- *Exponential-trapezoidal discretisation*: it adds a data-dependent two-tap convolution on the state input inside the
+  recurrence itself, which needs a different recurrence kernel. Gated DeltaNet keeps its separate short causal
+  convolution on the inputs instead.
+- *MIMO state updates*: the paper reports better accuracy at the same state size and decode speed, but MIMO needs new
+  kernels and new projections that cannot be initialised from Qwen's weights; out of scope for a short adaptation.
+- *Learnable B/C (key/query) biases*: the delta rule needs unit-norm keys, which a bias added after normalisation
+  would break.
 
 All new parameters (33M, 0.7% of the model) start at values that reproduce the original model almost exactly.
 
