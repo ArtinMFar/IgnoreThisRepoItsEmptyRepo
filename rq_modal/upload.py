@@ -9,13 +9,18 @@ import shutil
 
 import modal
 
-from rq_modal.common import BASE_MODEL, CKPT_DIR, OUT_DIR, VOL_PATH, cpu_image, hf_secret, volume
+from rq_modal.common import BASE_MODEL, CKPT_DIR, ENV, OUT_DIR, TRANSFORMERS, VOL_PATH, hf_secret, volume
 
 app = modal.App("rq-upload")
-image = cpu_image.uv_pip_install("torch==2.13.0", "torchvision==0.28.0",
-                                 extra_index_url="https://download.pytorch.org/whl/cpu",
-                                 extra_options="--index-strategy unsafe-best-match").add_local_dir(
-    "hub", remote_path="/root/hub")
+image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .uv_pip_install("torch==2.13.0", "torchvision==0.28.0", extra_index_url="https://download.pytorch.org/whl/cpu",
+                    extra_options="--index-strategy unsafe-best-match")
+    .uv_pip_install(TRANSFORMERS, "huggingface_hub[hf_xet]", "pillow", "safetensors", "jinja2")
+    .env(ENV)
+    .add_local_python_source("rq_modal", "recurrent_qwen")
+    .add_local_dir("hub", remote_path="/root/hub")
+)
 
 PROCESSOR_FILES = ["tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "preprocessor_config.json",
                    "video_preprocessor_config.json", "vocab.json", "merges.txt", "LICENSE"]
@@ -67,8 +72,8 @@ def upload(repo_name: str, ckpt: str = "final", private: bool = False):
     # sanity check: the released folder loads through the Auto classes with remote code and runs
     model = AutoModelForImageTextToText.from_pretrained(dst, trust_remote_code=True, dtype=torch.bfloat16)
     proc = AutoProcessor.from_pretrained(dst, trust_remote_code=True)
-    msgs = [{"role": "user", "content": "Say hi in three words."}]
-    ids = proc.apply_chat_template(msgs, add_generation_prompt=True, enable_thinking=False, return_tensors="pt",
+    msgs = [{"role": "user", "content": [{"type": "text", "text": "Say hi in three words."}]}]
+    ids = proc.apply_chat_template(msgs, add_generation_prompt=True, enable_thinking=False, tokenize=True, return_tensors="pt",
                                    return_dict=True)["input_ids"]
     out = model.generate(input_ids=ids, max_new_tokens=12, do_sample=False)
     print("sanity generation:", repr(proc.decode(out[0, ids.shape[1]:], skip_special_tokens=True)), flush=True)

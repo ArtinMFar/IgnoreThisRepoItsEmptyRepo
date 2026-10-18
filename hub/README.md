@@ -158,15 +158,15 @@ model = AutoModelForImageTextToText.from_pretrained(repo, trust_remote_code=True
                                                     device_map="cuda")
 processor = AutoProcessor.from_pretrained(repo, trust_remote_code=True)
 
-messages = [{"role": "user", "content": "Explain why the sky is blue in two sentences."}]
-inputs = processor.apply_chat_template(messages, add_generation_prompt=True, enable_thinking=False,
+messages = [{"role": "user", "content": [{"type": "text", "text": "Explain why the sky is blue in two sentences."}]}]
+inputs = processor.apply_chat_template(messages, add_generation_prompt=True, enable_thinking=False, tokenize=True,
                                        return_tensors="pt", return_dict=True).to("cuda")
 out = model.generate(**inputs, max_new_tokens=200)
 print(processor.decode(out[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True))
 ```
 
-Set `enable_thinking=True` for the reasoning mode. Images work as with Qwen3.5 (`{"type": "image", "image": ...}` in the
-message content).
+Set `enable_thinking=True` for the reasoning mode. Images work as with Qwen3.5: add `{"type": "image", "image": <PIL image,
+path or URL>}` to the message content list.
 
 ### Keeping a conversation's state (constant TTFT and memory)
 
