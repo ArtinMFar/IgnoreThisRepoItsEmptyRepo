@@ -45,8 +45,12 @@ def generate(max_think_tokens: int = 7000, max_nothink_tokens: int = 1500, limit
     plain_sp = SamplingParams(temperature=0.7, top_p=0.8, top_k=20, max_tokens=max_nothink_tokens,
                               stop_token_ids=stop, skip_special_tokens=False, seed=0)
 
-    inputs = [TokensPrompt(prompt_token_ids=tok.apply_chat_template(
-        p["messages"], tokenize=True, add_generation_prompt=True, enable_thinking=p["thinking"])) for p in prompts]
+    def prompt_ids(p):
+        text = tok.apply_chat_template(p["messages"], tokenize=False, add_generation_prompt=True,
+                                       enable_thinking=p["thinking"])
+        return tok(text, add_special_tokens=False).input_ids
+
+    inputs = [TokensPrompt(prompt_token_ids=prompt_ids(p)) for p in prompts]
     params = [think_sp if p["thinking"] else plain_sp for p in prompts]
     outs = llm.generate(inputs, params)
 

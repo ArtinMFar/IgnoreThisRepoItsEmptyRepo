@@ -22,6 +22,51 @@ import modal
 from rq_modal.common import BASE_MODEL, CKPT_DIR, DATA_DIR, VOL_PATH, gpu_image, hf_secret, volume
 
 app = modal.App("rq-train")
+# On-policy generations are published here when ready; the trainer polls it, so training needn't wait for them.
+gen_volume = modal.Volume.from_name("rq-gen", create_if_missing=True)
+GEN_PATH = "/gen"
+
+
+def load_onpolicy(pool):
+    """Teacher generations -> packed (ids, mask) text sequences; image answers are appended to the vision pool."""
+    import numpy as np
+
+    from rq_modal.common import IM_END, NEWLINE
+
+    def pack_items(items, max_len):
+        seqs, cur_ids, cur_mask = [], [], []
+        for ids, mask in items:
+            if len(ids) > max_len:
+                continue
+            if len(cur_ids) + len(ids) > max_len:
+                seqs.append((cur_ids, cur_mask))
+                cur_ids, cur_mask = [], []
+            cur_ids, cur_mask = cur_ids + ids, cur_mask + mask
+        if cur_ids:
+            seqs.append((cur_ids, cur_mask))
+        return seqs
+
+    path = f"{GEN_PATH}/gen_outputs.jsonl"
+    if not os.path.exists(path):
+        return None
+    items = {True: [], False: []}
+    n_img = 0
+    for line in open(path):
+        r = json.loads(line)
+        if r["kind"] == "image":
+            pool.append(r)
+            n_img += 1
+            continue
+        ids = r["prompt_ids"] + r["output_ids"]
+        mask = [0] * len(r["prompt_ids"]) + [1] * len(r["output_ids"])
+        if r["finished"]:
+            ids, mask = ids + [IM_END], mask + [1]
+        items[r["thinking"]].append((ids + [NEWLINE], mask + [0]))
+    seqs = pack_items(items[True], 16384) + pack_items(items[False], 8192)
+    random.Random(1).shuffle(seqs)
+    print(f"loaded on-policy data: {len(seqs)} sequences, {sum(len(a) for a, _ in seqs)} tokens, {n_img} image "
+          "answers", flush=True)
+    return [(np.array(a, dtype=np.int32), np.array(m, dtype=np.uint8)) for a, m in seqs]
 
 
 def lr_factor(progress, step, warmup=20, decay_start=0.8, final=0.1):
@@ -63,16 +108,18 @@ def vision_worker(processor, pool, out_q, target_tokens, seed):
             print("vision batch skipped:", repr(e)[:200], flush=True)
 
 
-@app.function(image=gpu_image, gpu="B200", volumes={VOL_PATH: volume}, secrets=[hf_secret], timeout=6 * 3600,
-              cpu=16, memory=196608, retries=modal.Retries(max_retries=2, initial_delay=10.0))
-def train(budget_minutes: float = 150.0, smoke: bool = False, tokens_per_step: int = 65536,
+@app.function(image=gpu_image, gpu="B200", volumes={VOL_PATH: volume, GEN_PATH: gen_volume}, secrets=[hf_secret],
+              timeout=6 * 3600,
+              cpu=8, memory=65536, retries=modal.Retries(max_retries=2, initial_delay=10.0))
+def train(budget_minutes: float = 130.0, smoke: bool = False, tokens_per_step: int = 65536,
           lr: float = 1e-5, ce_weight: float = 0.2, vision_tokens: int = 6000, ckpt_minutes: float = 30.0,
-          chunk: int = 4096, attn: str = "sdpa"):
+          chunk: int = 4096, attn: str = "flex", profile: bool = False, pad_multiple: int = 2048):
     import numpy as np
     import torch
     import torch.nn.functional as F
     from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
+    import recurrent_qwen.modeling_recurrent_qwen as rqm
     from recurrent_qwen.convert import load_from_base
     from recurrent_qwen.modeling_recurrent_qwen import RecurrentQwenForConditionalGeneration
     from rq_modal.batches import text_batch
@@ -80,9 +127,11 @@ def train(budget_minutes: float = 150.0, smoke: bool = False, tokens_per_step: i
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     dev = torch.device("cuda")
+    # "flex": block-sparse sliding-window attention for the student (sequences padded to a few fixed lengths)
+    rqm.TRAIN_ATTENTION = "flex" if attn == "flex" else None
     t_start = time.time()
     run_dir = f"{CKPT_DIR}/smoke" if smoke else f"{CKPT_DIR}/latest"
-    state = dict(step=0, seq_index=0, elapsed=0.0, tokens=0)
+    state = dict(step=0, seq_index=0, elapsed=0.0, tokens=0, onpolicy_index=0)
     if not smoke and os.path.exists(f"{run_dir}/train_state.json"):
         state = json.load(open(f"{run_dir}/train_state.json"))
         print("resuming from", state, flush=True)
@@ -93,31 +142,34 @@ def train(budget_minutes: float = 150.0, smoke: bool = False, tokens_per_step: i
     teacher.requires_grad_(False)
     if state["step"] > 0:
         student = RecurrentQwenForConditionalGeneration.from_pretrained(run_dir, dtype=torch.float32,
-                                                                        attn_implementation=attn)
+                                                                        attn_implementation="sdpa")
     else:
-        student = load_from_base(BASE_MODEL, dtype=torch.float32, attn_implementation=attn)
+        student = load_from_base(BASE_MODEL, dtype=torch.float32, attn_implementation="sdpa")
     student.to(dev).train()
     student.config.use_cache = False
     student.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
-    groups = {"gates": [], "gate_scalars": [], "vision": [], "base": []}
+    groups = {"skip_proj": [], "phase_proj": [], "gate_scalars": [], "vision": [], "base": []}
     for n, p in student.named_parameters():
         if n.endswith(("skip_redundancy", "skip_bias")):
             groups["gate_scalars"].append(p)
-        elif "skip_proj" in n or "phase_proj" in n:
-            groups["gates"].append(p)
+        elif "skip_proj" in n:
+            groups["skip_proj"].append(p)
+        elif "phase_proj" in n:
+            # its gradient accumulates over the sequence through the cumulative phase, so keep its steps small
+            groups["phase_proj"].append(p)
         elif n.startswith("model.visual."):
             groups["vision"].append(p)
         else:
             groups["base"].append(p)
-    base_lrs = {"gates": 3e-4, "gate_scalars": 3e-3, "vision": lr * 0.2, "base": lr}
+    base_lrs = {"skip_proj": 3e-4, "phase_proj": 2e-5, "gate_scalars": 3e-3, "vision": lr * 0.2, "base": lr}
     opt = torch.optim.AdamW([dict(params=v, lr=base_lrs[k], name=k) for k, v in groups.items()],
                             betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0, fused=True)
     print({k: sum(p.numel() for p in v) for k, v in groups.items()}, flush=True)
 
     d = f"{DATA_DIR}/train"
-    ids_all = np.load(f"{d}/ids.npy", mmap_mode="r")
-    mask_all = np.load(f"{d}/mask.npy", mmap_mode="r")
+    ids_all = np.load(f"{d}/ids.npy")
+    mask_all = np.load(f"{d}/mask.npy")
     lens = np.load(f"{d}/lens.npy")
     offs = np.concatenate([[0], np.cumsum(lens)])
     total_tokens = int(offs[-1])
@@ -133,9 +185,17 @@ def train(budget_minutes: float = 150.0, smoke: bool = False, tokens_per_step: i
     def micro_loss(batch, norm):
         """Forward teacher + student on one sequence, backprop the chunked KL/CE loss. Returns (kl, ce, n_ce)."""
         inputs = {k: v.to(dev) for k, v in batch["inputs"].items()}
-        ids = inputs["input_ids"]
         kl_mask = batch["kl_mask"].to(dev)[0]
         ce_mask = batch["ce_mask"].to(dev)[0]
+        # right-pad to a multiple of `pad_multiple` so the compiled attention only sees a few shapes; padding comes
+        # after the real tokens (causal), and is excluded from the loss
+        pad = (-inputs["input_ids"].shape[1]) % pad_multiple
+        if pad:
+            inputs["input_ids"] = F.pad(inputs["input_ids"], (0, pad), value=248044)
+            if "mm_token_type_ids" in inputs:
+                inputs["mm_token_type_ids"] = F.pad(inputs["mm_token_type_ids"], (0, pad), value=0)
+            kl_mask, ce_mask = F.pad(kl_mask, (0, pad), value=False), F.pad(ce_mask, (0, pad), value=False)
+        ids = inputs["input_ids"]
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
             t_h = teacher.model(**inputs, use_cache=False).last_hidden_state[0]
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -169,6 +229,45 @@ def train(budget_minutes: float = 150.0, smoke: bool = False, tokens_per_step: i
         s_h.backward(s_leaf.grad)
         return kl_sum, ce_sum, n_ce, int(kl_mask.sum())
 
+    if profile:
+        from torch.profiler import ProfilerActivity, profile as torch_profile
+
+        longest = int(np.argmax(lens))
+        a, b = offs[longest], offs[longest + 1]
+        batch = text_batch(np.asarray(ids_all[a:b]), np.asarray(mask_all[a:b]))
+        T = b - a
+        inputs = {k: v.to(dev) for k, v in batch["inputs"].items()}
+
+        def timed(fn, reps=2):
+            fn()
+            torch.cuda.synchronize()
+            t0 = time.time()
+            for _ in range(reps):
+                fn()
+            torch.cuda.synchronize()
+            return (time.time() - t0) / reps
+
+        def t_fwd():
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                teacher.model(**inputs, use_cache=False)
+
+        def s_fwd():
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                student.model(**inputs, use_cache=False)
+
+        def full():
+            micro_loss(batch, T)
+            opt.zero_grad(set_to_none=True)
+
+        print(f"T={T} teacher fwd {timed(t_fwd):.2f}s  student fwd {timed(s_fwd):.2f}s  "
+              f"full micro step {timed(full):.2f}s -> {T / timed(full, 1):.0f} tok/s", flush=True)
+        with torch_profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+            full()
+            torch.cuda.synchronize()
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30), flush=True)
+        print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30), flush=True)
+        return {}
+
     def save(path, final=False):
         t0 = time.time()
         os.makedirs(path, exist_ok=True)
@@ -180,12 +279,13 @@ def train(budget_minutes: float = 150.0, smoke: bool = False, tokens_per_step: i
         print(f"saved {path} in {time.time() - t0:.0f}s", flush=True)
 
     budget_s = budget_minutes * 60
+    onpolicy = None
     seq_index = state["seq_index"]
     last_ckpt = time.time()
     log = []
     while True:
         elapsed = state["elapsed"] + (time.time() - t_start)
-        progress = max(elapsed / budget_s, state["tokens"] / max(total_tokens, 1))
+        progress = max(elapsed / budget_s, seq_index / len(lens))
         if progress >= 1.0 or seq_index >= len(lens) or (smoke and state["step"] >= 6):
             break
         f = lr_factor(progress, state["step"])
@@ -193,6 +293,17 @@ def train(budget_minutes: float = 150.0, smoke: bool = False, tokens_per_step: i
             g["lr"] = base_lrs[g["name"]] * f
 
         batches, n = [], 0
+        if onpolicy is None and state["step"] % 20 == 0:
+            try:
+                gen_volume.reload()
+                onpolicy = load_onpolicy(pool)
+            except Exception as e:
+                print("on-policy data not loaded yet:", repr(e)[:200], flush=True)
+        if onpolicy is not None and state.get("onpolicy_index", 0) < len(onpolicy):
+            a_ids, a_mask = onpolicy[state["onpolicy_index"]]
+            state["onpolicy_index"] = state.get("onpolicy_index", 0) + 1
+            batches.append(text_batch(a_ids, a_mask))
+            n += len(a_ids)
         while n < tokens_per_step - vision_tokens and seq_index < len(lens):
             a, b = offs[seq_index], offs[seq_index + 1]
             batches.append(text_batch(np.asarray(ids_all[a:b]), np.asarray(mask_all[a:b])))
@@ -212,7 +323,10 @@ def train(budget_minutes: float = 150.0, smoke: bool = False, tokens_per_step: i
         for batch in batches:
             k, c, nc, nk = micro_loss(batch, n)
             kl_t, ce_t, n_ce, n_kl = kl_t + k, ce_t + c, n_ce + nc, n_kl + nk
-        gnorm = torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0).item()
+        # the base model is clipped as a whole; each group of new gates separately so they can't dominate it
+        gnorm = torch.nn.utils.clip_grad_norm_(groups["base"] + groups["vision"], 1.0).item()
+        gate_norms = {k: round(torch.nn.utils.clip_grad_norm_(groups[k], 1.0).item(), 2)
+                      for k in ("skip_proj", "phase_proj", "gate_scalars")}
         opt.step()
         opt.zero_grad(set_to_none=True)
         torch.cuda.synchronize()
@@ -220,7 +334,7 @@ def train(budget_minutes: float = 150.0, smoke: bool = False, tokens_per_step: i
         state["step"] += 1
         state["tokens"] += text_tokens
         state["seq_index"] = seq_index
-        rec = dict(step=state["step"], kl=kl_t / max(n_kl, 1), ce=ce_t / max(n_ce, 1), gnorm=gnorm, lr_f=f,
+        rec = dict(step=state["step"], kl=kl_t / max(n_kl, 1), ce=ce_t / max(n_ce, 1), gnorm=gnorm, **gate_norms, lr_f=f,
                    tok_s=n / dt, progress=progress, mem_gb=torch.cuda.max_memory_allocated() / 2**30)
         log.append(rec)
         if state["step"] % 5 == 0 or smoke or state["step"] <= 3:
@@ -249,5 +363,5 @@ def train(budget_minutes: float = 150.0, smoke: bool = False, tokens_per_step: i
 
 
 @app.local_entrypoint()
-def main(smoke: bool = False, budget_minutes: float = 150.0, attn: str = "sdpa"):
-    print(train.remote(budget_minutes=budget_minutes, smoke=smoke, attn=attn))
+def main(smoke: bool = False, budget_minutes: float = 130.0, attn: str = "flex", profile: bool = False):
+    print(train.remote(budget_minutes=budget_minutes, smoke=smoke, attn=attn, profile=profile))

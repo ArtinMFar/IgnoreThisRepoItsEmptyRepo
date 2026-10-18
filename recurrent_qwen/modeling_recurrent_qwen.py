@@ -67,6 +67,44 @@ from .configuration_recurrent_qwen import RecurrentQwenConfig, RecurrentQwenText
 # Cache slot used for the extra recurrent state (key buffer in the conv slot, rotary phase in the recurrent slot).
 _EXTRA_STATE = 1
 
+# Opt-in fast path for training: block-sparse FlexAttention over the sliding window (set to "flex" by the trainer).
+# Inference uses the regular attention implementation chosen with `attn_implementation`.
+TRAIN_ATTENTION = None
+_flex_fn = None
+_block_masks = {}
+
+
+def flex_sliding_window(query, key, value, window, scaling):
+    """Causal sliding-window attention computed only on the band of `window` keys. (B, H, T, D) in, (B, T, H, D) out."""
+    global _flex_fn
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+    if _flex_fn is None:
+        torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
+        _flex_fn = torch.compile(flex_attention, dynamic=False)
+    T = query.shape[2]
+    key_ = (T, window, query.device)
+    if key_ not in _block_masks:
+        def sliding(b, h, q_idx, kv_idx):
+            return (q_idx >= kv_idx) & (q_idx - kv_idx < window)
+
+        _block_masks[key_] = create_block_mask(sliding, B=None, H=None, Q_LEN=T, KV_LEN=T, device=query.device)
+    out = _flex_fn(query, key, value, block_mask=_block_masks[key_], scale=scaling, enable_gqa=True)
+    return out.transpose(1, 2).contiguous()
+
+
+def cumulative_phase(steps: torch.Tensor, chunk: int = 64) -> torch.Tensor:
+    """cumsum over dim 1 modulo 2*pi, in two levels so float32 stays accurate on long sequences."""
+    batch, seq_len = steps.shape[:2]
+    pad = (-seq_len) % chunk
+    x = F.pad(steps, (0, 0, 0, 0, 0, pad)) if pad else steps
+    x = x.view(batch, -1, chunk, *steps.shape[2:])
+    inner = x.cumsum(2)
+    totals = inner[:, :, -1].double()
+    offsets = torch.remainder(totals.cumsum(1) - totals, 2 * math.pi).float()
+    phase = torch.remainder(inner + offsets[:, :, None], 2 * math.pi)
+    return phase.reshape(batch, -1, *steps.shape[2:])[:, :seq_len]
+
 
 def local_redundancy(keys: torch.Tensor, prev_keys: torch.Tensor | None, window: int, chunk: int = 512) -> torch.Tensor:
     """Max cosine similarity of each key with the `window` keys before it.
@@ -211,10 +249,11 @@ class RecurrentQwenGatedDeltaNet(Qwen3_5GatedDeltaNet):
 
         # Data-dependent rotation: phase_t = sum_{s<=t} keep_s * pi * tanh(theta_s), kept modulo 2*pi.
         step = math.pi * torch.tanh(theta.float().view(batch_size, seq_len, self.num_v_heads, self.rotary_pairs))
-        phase = torch.cumsum((keep.unsqueeze(-1) * step).double(), dim=1)
+        phase = cumulative_phase(keep.unsqueeze(-1) * step)
         if use_precomputed_states:
-            phase = phase + cache_params.layers[self.layer_idx].recurrent_states[_EXTRA_STATE].double()[:, None]
-        phase = torch.remainder(phase, 2 * math.pi).float()
+            phase = torch.remainder(
+                phase + cache_params.layers[self.layer_idx].recurrent_states[_EXTRA_STATE][:, None], 2 * math.pi
+            )
         if cache_params is not None:
             cache_params.update_recurrent_state(phase[:, -1].contiguous(), self.layer_idx, state_idx=_EXTRA_STATE)
         cos, sin = phase.cos(), phase.sin()
@@ -281,6 +320,13 @@ class RecurrentQwenAttention(Qwen3_5Attention):
 
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+        if TRAIN_ATTENTION == "flex" and past_key_values is None and query_states.is_cuda:
+            attn_output = flex_sliding_window(query_states, key_states, value_states, self.sliding_window,
+                                              self.scaling)
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attn_output = attn_output * torch.sigmoid(gate)
+            return self.o_proj(attn_output), None
 
         attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward

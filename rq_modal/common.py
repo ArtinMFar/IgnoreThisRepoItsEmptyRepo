@@ -40,8 +40,9 @@ gpu_image = (
     .add_local_python_source("rq_modal", "recurrent_qwen")
 )
 
+# FlashInfer (used by vLLM) JIT-compiles kernels, so this image needs the CUDA toolkit (13.0 matches the host driver)
 vllm_image = (
-    modal.Image.debian_slim(python_version="3.12")
+    modal.Image.from_registry("nvidia/cuda:13.0.2-devel-ubuntu24.04", add_python="3.12")
     .uv_pip_install("vllm==0.31.0", "huggingface_hub[hf_xet]", "pillow", "pyarrow")
     .env(ENV)
     .add_local_python_source("rq_modal")

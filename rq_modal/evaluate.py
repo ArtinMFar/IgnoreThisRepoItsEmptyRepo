@@ -6,6 +6,7 @@
 Results go to /vol/out/eval_<model>.json.
 """
 
+import ast
 import json
 import os
 import re
@@ -87,7 +88,7 @@ def eval_ppl(model, tok, n_books, length):
             continue
         x = torch.tensor(ids[: length + 1], device="cuda")[None]
         with torch.no_grad():
-            nll = chunked_nll(model, x[:, :-1].contiguous() if False else x)
+            nll = chunked_nll(model, x)
         nll = nll[:length]
         for lo, hi in buckets:
             sums[(lo, hi)] += nll[lo:hi].sum().item()
@@ -133,6 +134,20 @@ def generate(model, tok, messages, thinking, max_new_tokens):
     return tok.decode(out[0, ids.shape[1] :], skip_special_tokens=True), ids.shape[1]
 
 
+def generate_batch(model, tok, conversations, thinking, max_new_tokens):
+    """Greedy generation for many short prompts at once (left padding)."""
+    import torch
+
+    texts = [tok.apply_chat_template(m, tokenize=False, add_generation_prompt=True, enable_thinking=thinking)
+             for m in conversations]
+    tok.padding_side = "left"
+    enc = tok(texts, return_tensors="pt", padding=True, add_special_tokens=False).to("cuda")
+    with torch.no_grad():
+        out = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False, temperature=None, top_p=None,
+                             top_k=None, pad_token_id=tok.pad_token_id)
+    return [tok.decode(o[enc["input_ids"].shape[1] :], skip_special_tokens=True) for o in out]
+
+
 def eval_longbench(model, tok, per_bucket, max_prompt_tokens=24000):
     from datasets import load_dataset
 
@@ -156,7 +171,7 @@ def eval_longbench(model, tok, per_bucket, max_prompt_tokens=24000):
                 prompt = r["context"].rstrip() + "\n\n" + r["question"].strip() + "\n" + (r["answer_prefix"] or "")
                 pred, _ = generate(model, tok, [{"role": "user", "content": prompt}], False,
                                    int(r["max_new_tokens"] or 64))
-                golds = eval(r["answers"]) if isinstance(r["answers"], str) else r["answers"]
+                golds = ast.literal_eval(r["answers"]) if isinstance(r["answers"], str) else r["answers"]
                 if task.startswith("passage_retrieval"):
                     nums = re.findall(r"\d+", pred)
                     score = float(bool(nums) and any(nums[0] == re.findall(r"\d+", g)[0] for g in golds))
@@ -178,9 +193,11 @@ def eval_gsm8k(model, tok, n, thinking):
 
     ds = load_dataset("openai/gsm8k", "main", split="test").select(range(n))
     correct, lengths, long_traces = 0, [], 0
-    for r in ds:
-        msg = [{"role": "user", "content": r["question"] + "\nPut the final answer after 'Answer:'."}]
-        out, _ = generate(model, tok, msg, thinking, 6144 if thinking else 1024)
+    convs = [[{"role": "user", "content": r["question"] + "\nPut the final answer after 'Answer:'."}] for r in ds]
+    outs = []
+    for i in range(0, n, 64):
+        outs += generate_batch(model, tok, convs[i : i + 64], thinking, 6144 if thinking else 1024)
+    for r, out in zip(ds, outs):
         n_tok = len(tok(out).input_ids)
         lengths.append(n_tok)
         long_traces += n_tok > 2048
@@ -306,23 +323,30 @@ def evaluate(name: str, quick: bool = False):
     model = load_model(name)
     t0 = time.time()
     res = dict(model=name)
-    res["pg19_ppl"] = eval_ppl(model, tok, n_books=4 if quick else 16, length=32768)
-    print("ppl", res["pg19_ppl"], flush=True)
-    res["longbench_e"] = eval_longbench(model, tok, per_bucket=2 if quick else 8)
-    if name != "naive":
-        res["gsm8k_think"] = eval_gsm8k(model, tok, 10 if quick else 80, thinking=True)
-        print("gsm8k think", res["gsm8k_think"], flush=True)
-        res["gsm8k_nothink"] = eval_gsm8k(model, tok, 10 if quick else 120, thinking=False)
-        print("gsm8k no-think", res["gsm8k_nothink"], flush=True)
-        res["arc_challenge"] = eval_arc(model, tok, 50 if quick else 400)
-        print("arc", res["arc_challenge"], flush=True)
-        res["chartqa"] = eval_chartqa(model, processor, 20 if quick else 150)
-        print("chartqa", res["chartqa"], flush=True)
-        res["bench"] = bench(model, tok, [4096, 16384] if quick else [4096, 16384, 65536, 131072])
-    res["eval_minutes"] = round((time.time() - t0) / 60, 1)
+    out_path = f"{OUT_DIR}/eval_{name}{'_quick' if quick else ''}.json"
     os.makedirs(OUT_DIR, exist_ok=True)
-    json.dump(res, open(f"{OUT_DIR}/eval_{name}{'_quick' if quick else ''}.json", "w"), indent=1)
-    volume.commit()
+
+    def run(key, fn):
+        try:
+            res[key] = fn()
+        except Exception as e:  # keep the other sections
+            import traceback
+
+            traceback.print_exc()
+            res[key] = f"failed: {e!r}"[:500]
+        print(key, res[key], flush=True)
+        res["eval_minutes"] = round((time.time() - t0) / 60, 1)
+        json.dump(res, open(out_path, "w"), indent=1)
+        volume.commit()
+
+    run("pg19_ppl", lambda: eval_ppl(model, tok, n_books=4 if quick else 16, length=32768))
+    run("longbench_e", lambda: eval_longbench(model, tok, per_bucket=2 if quick else 6))
+    if name != "naive":
+        run("arc_challenge", lambda: eval_arc(model, tok, 50 if quick else 400))
+        run("chartqa", lambda: eval_chartqa(model, processor, 20 if quick else 150))
+        run("gsm8k_nothink", lambda: eval_gsm8k(model, tok, 10 if quick else 120, thinking=False))
+        run("gsm8k_think", lambda: eval_gsm8k(model, tok, 10 if quick else 80, thinking=True))
+        run("bench", lambda: bench(model, tok, [4096, 16384] if quick else [4096, 16384, 65536, 131072]))
     return res
 
 

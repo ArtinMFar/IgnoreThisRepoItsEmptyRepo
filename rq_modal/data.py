@@ -388,3 +388,23 @@ def pack_fn():
 @app.local_entrypoint()
 def pack():
     pack_fn.remote()
+
+
+gen_volume = modal.Volume.from_name("rq-gen", create_if_missing=True)
+
+
+@app.function(image=cpu_image, volumes={VOL_PATH: volume, "/gen": gen_volume}, timeout=1800)
+def publish_gen_fn():
+    """Copy the teacher generations to the volume the running trainer polls."""
+    import shutil
+
+    volume.reload()
+    shutil.copy(f"{DATA_DIR}/gen_outputs.jsonl", "/gen/gen_outputs.jsonl.tmp")
+    os.replace("/gen/gen_outputs.jsonl.tmp", "/gen/gen_outputs.jsonl")
+    gen_volume.commit()
+    print("published", os.path.getsize("/gen/gen_outputs.jsonl") // 2**20, "MB")
+
+
+@app.local_entrypoint()
+def publish_gen():
+    publish_gen_fn.remote()
